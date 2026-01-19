@@ -52,6 +52,14 @@ struct LoginResponse {
     token: String,
 }
 
+#[derive(Serialize)]
+struct ProcessInfo {
+    pid: u32,
+    name: String,
+    cpu_usage: f32,
+    memory: u64,
+}
+
 #[tokio::main]
 async fn main() {
     let sys = System::new_with_specifics(
@@ -68,7 +76,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/system", get(get_system_metrics))
-        .route_layer(middleware::from_fn(auth_middleware)) // Protect system route
+        .route("/api/processes", get(get_processes))
+        .route_layer(middleware::from_fn(auth_middleware)) // Protect routes
         .route("/api/login", post(login_handler))          // Public login route
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -76,6 +85,26 @@ async fn main() {
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("🚀 RustPanel Core running on http://0.0.0.0:3000");
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn get_processes(State(state): State<AppState>) -> Json<Vec<ProcessInfo>> {
+    let mut sys = state.sys.lock().unwrap();
+    sys.refresh_processes();
+
+    let mut processes: Vec<ProcessInfo> = sys.processes().iter()
+        .map(|(pid, process)| ProcessInfo {
+            pid: pid.as_u32(),
+            name: process.name().to_string(),
+            cpu_usage: process.cpu_usage(),
+            memory: process.memory(),
+        })
+        .collect();
+
+    // Sort by CPU usage descending and take top 20
+    processes.sort_by(|a, b| b.cpu_usage.partial_cmp(&a.cpu_usage).unwrap_or(std::cmp::Ordering::Equal));
+    processes.truncate(20);
+
+    Json(processes)
 }
 
 async fn login_handler(Json(payload): Json<LoginRequest>) -> Result<Json<LoginResponse>, StatusCode> {
@@ -130,7 +159,8 @@ async fn get_system_metrics(State(state): State<AppState>) -> Json<SystemMetrics
     
     sys.refresh_cpu();
     sys.refresh_memory();
-    disks.refresh_list();
+    // Optimization: Don't refresh the list (hardware scan) every time, just the usage stats.
+    // In a real prod app, we would refresh the list in a background task every minute.
     disks.refresh();
 
     let cpu_usage = sys.global_cpu_info().cpu_usage();
