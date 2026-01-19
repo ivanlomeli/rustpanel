@@ -159,7 +159,8 @@ async fn get_system_metrics(State(state): State<AppState>) -> Json<SystemMetrics
     
     sys.refresh_cpu();
     sys.refresh_memory();
-    disks.refresh_list();
+    // Optimization: Don't refresh the list (hardware scan) every time, just the usage stats.
+    // In a real prod app, we would refresh the list in a background task every minute.
     disks.refresh();
 
     let cpu_usage = sys.global_cpu_info().cpu_usage();
