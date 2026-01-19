@@ -8,6 +8,9 @@ interface SystemMetrics {
   total_memory: number;
   used_memory: number;
   memory_percentage: number;
+  total_disk: number;
+  used_disk: number;
+  disk_percentage: number;
   os_name: string;
   host_name: string;
 }
@@ -87,8 +90,9 @@ function App() {
             color="text-purple-400"
           />
           <StatCard 
-            title="Status" 
-            value="Online" 
+            title="Disk Usage" 
+            value={metrics ? `${metrics.disk_percentage.toFixed(1)}%` : '-'} 
+            subValue={metrics ? `${formatBytes(metrics.used_disk)} / ${formatBytes(metrics.total_disk)}` : ''}
             color="text-green-400"
           />
         </div>
