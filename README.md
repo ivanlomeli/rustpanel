@@ -12,12 +12,19 @@
 ## Stack (Planned)
 
 - **Core:** Rust
-- **Web Framework:** Axum (To be confirmed)
-- **Frontend:** React/TypeScript (To be confirmed)
-- **Database:** SQLite/PostgreSQL
+- **Web Framework:** Axum
+- **Frontend:** React/TypeScript
+- **Database:** SQLite (Implemented via SQLx)
+- **Security:** Bcrypt hashing + JWT Auth
+- **System:** Systemd integration & sysinfo
 
 ## Getting Started
 
+1. The system creates a default admin user on first run:
+   - User: `admin`
+   - Pass: `password`
+
+2. Run the backend:
 ```bash
 cargo run
 ```
