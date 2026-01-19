@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import axios from 'axios';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { LayoutDashboard, Server, Settings, Activity, HardDrive, LogOut } from 'lucide-react';
+import { LayoutDashboard, Server, Settings, Activity, HardDrive, LogOut, Folder, File, CornerLeftUp } from 'lucide-react';
 
 interface SystemMetrics {
   cpu_usage: number;
@@ -22,17 +22,25 @@ interface ProcessInfo {
   memory: number;
 }
 
+interface FileInfo {
+  name: string;
+  is_dir: boolean;
+  size: number;
+}
+
 function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
-  // Tabs: 'dashboard' | 'processes'
+  // Tabs: 'dashboard' | 'processes' | 'files'
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [currentPath, setCurrentPath] = useState('.');
 
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
+  const [files, setFiles] = useState<FileInfo[]>([]);
   const [history, setHistory] = useState<{ time: string; cpu: number; mem: number }[]>([]);
 
   // Configure Axios Auth Header
@@ -79,12 +87,11 @@ function App() {
         return newHistory;
       });
 
-      // Fetch processes only if tab is active
+      // Fetch specific tab data
       if (activeTab === 'processes') {
         const procRes = await axios.get('http://localhost:3000/api/processes');
         setProcesses(procRes.data);
       }
-
     } catch (error) {
       console.error("Error fetching data:", error);
       if (axios.isAxiosError(error) && error.response?.status === 401) {
@@ -92,6 +99,15 @@ function App() {
       }
     }
   };
+
+  // Fetch files when path or tab changes
+  useEffect(() => {
+    if (token && activeTab === 'files') {
+      axios.get(`http://localhost:3000/api/files?path=${currentPath}`)
+        .then(res => setFiles(res.data))
+        .catch(err => console.error("Error fetching files:", err));
+    }
+  }, [token, activeTab, currentPath]);
 
   useEffect(() => {
     if (token) {
@@ -101,9 +117,23 @@ function App() {
     }
   }, [token, activeTab]);
 
+  const navigate = (name: string) => {
+    setCurrentPath(prev => prev === '.' ? name : `${prev}/${name}`);
+  };
+
+  const navigateUp = () => {
+    if (currentPath === '.') return;
+    const parts = currentPath.split('/');
+    parts.pop();
+    setCurrentPath(parts.length === 0 ? '.' : parts.join('/'));
+  };
+
   const formatBytes = (bytes: number) => {
     const gb = bytes / (1024 * 1024 * 1024);
-    return `${gb.toFixed(2)} GB`;
+    if (gb >= 1) return `${gb.toFixed(2)} GB`;
+    const mb = bytes / (1024 * 1024);
+    if (mb >= 1) return `${mb.toFixed(2)} MB`;
+    return `${(bytes / 1024).toFixed(2)} KB`;
   };
 
   const formatMb = (bytes: number) => {
@@ -175,7 +205,12 @@ function App() {
             active={activeTab === 'processes'}
             onClick={() => setActiveTab('processes')}
           />
-          <NavItem icon={<HardDrive />} label="Files" onClick={() => alert("Files coming soon!")} />
+          <NavItem 
+            icon={<HardDrive />} 
+            label="Files" 
+            active={activeTab === 'files'}
+            onClick={() => setActiveTab('files')}
+          />
           <NavItem icon={<Settings />} label="Settings" onClick={() => alert("Settings coming soon!")} />
         </nav>
         <button onClick={handleLogout} className="flex items-center gap-3 p-3 rounded-lg text-red-400 hover:bg-red-500/10 cursor-pointer mt-auto">
@@ -283,6 +318,49 @@ function App() {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {activeTab === 'files' && (
+          <div className="bg-gray-800 rounded-lg shadow-lg border border-gray-700 overflow-hidden">
+             <div className="p-4 border-b border-gray-700 bg-gray-800/50 flex items-center gap-4">
+               <button 
+                 onClick={navigateUp}
+                 disabled={currentPath === '.'}
+                 className="p-2 hover:bg-gray-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+               >
+                 <CornerLeftUp size={20} />
+               </button>
+               <div className="font-mono text-sm bg-gray-900 px-3 py-1 rounded w-full">
+                 {currentPath}
+               </div>
+             </div>
+             <div className="max-h-[70vh] overflow-y-auto">
+               <table className="w-full text-left border-collapse">
+                 <tbody className="divide-y divide-gray-700">
+                   {files.map((file, idx) => (
+                     <tr 
+                       key={idx} 
+                       className="hover:bg-gray-700/50 transition-colors cursor-pointer"
+                       onClick={() => file.is_dir && navigate(file.name)}
+                     >
+                       <td className="p-4 flex items-center gap-3">
+                         {file.is_dir ? 
+                           <Folder className="text-blue-400" size={20} /> : 
+                           <File className="text-gray-400" size={20} />
+                         }
+                         <span className={file.is_dir ? 'font-bold text-blue-100' : 'text-gray-300'}>
+                           {file.name}
+                         </span>
+                       </td>
+                       <td className="p-4 text-right text-sm text-gray-500 w-32">
+                         {!file.is_dir && formatBytes(file.size)}
+                       </td>
+                     </tr>
+                   ))}
+                 </tbody>
+               </table>
+             </div>
           </div>
         )}
       </main>

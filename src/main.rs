@@ -1,11 +1,13 @@
 use axum::{
-    extract::{State, Request},
+    extract::{Query, State, Request},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use std::fs;
+use std::path::Path;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -13,13 +15,17 @@ use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const SECRET_KEY: &[u8] = b"secret_key_change_me_in_production";
+use sqlx::sqlite::SqlitePool;
+use dotenvy::dotenv;
+use std::env;
+use bcrypt::{hash, verify, DEFAULT_COST};
 
 #[derive(Clone)]
 struct AppState {
     sys: Arc<Mutex<System>>,
     disks: Arc<Mutex<Disks>>,
+    db: SqlitePool,
+    jwt_secret: String,
 }
 
 #[derive(Serialize)]
@@ -60,8 +66,54 @@ struct ProcessInfo {
     memory: u64,
 }
 
+#[derive(Serialize)]
+struct ServiceInfo {
+    name: String,
+    status: String,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct FileInfo {
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+
+    let pool = SqlitePool::connect(&database_url).await.expect("Failed to connect to database");
+    
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL
+        )"
+    ).execute(&pool).await.unwrap();
+
+    let admin_exists = sqlx::query("SELECT 1 FROM users WHERE username = 'admin'")
+        .fetch_optional(&pool).await.unwrap();
+
+    if admin_exists.is_none() {
+        let hashed = hash("password", DEFAULT_COST).unwrap();
+        sqlx::query("INSERT INTO users (username, password) VALUES (?, ?)")
+            .bind("admin")
+            .bind(hashed)
+            .execute(&pool).await.unwrap();
+        println!("👤 Created default admin user (admin / password)");
+    }
+
     let sys = System::new_with_specifics(
         RefreshKind::new()
             .with_cpu(CpuRefreshKind::everything())
@@ -72,19 +124,89 @@ async fn main() {
     let state = AppState {
         sys: Arc::new(Mutex::new(sys)),
         disks: Arc::new(Mutex::new(disks)),
+        db: pool,
+        jwt_secret,
     };
 
     let app = Router::new()
         .route("/api/system", get(get_system_metrics))
         .route("/api/processes", get(get_processes))
-        .route_layer(middleware::from_fn(auth_middleware)) // Protect routes
-        .route("/api/login", post(login_handler))          // Public login route
+        .route("/api/services", get(get_services))
+        .route("/api/files", get(list_files))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .route("/api/login", post(login_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("🚀 RustPanel Core running on http://0.0.0.0:3000");
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    println!("🚀 RustPanel Core running on http://{}", addr);
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn list_files(Query(params): Query<FileQuery>) -> Result<Json<Vec<FileInfo>>, StatusCode> {
+    let default_path = ".".to_string();
+    let path_str = params.path.as_ref().unwrap_or(&default_path);
+    let path = Path::new(path_str);
+
+    if path_str.contains("..") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            let mut files = Vec::new();
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    files.push(FileInfo {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        is_dir: metadata.is_dir(),
+                        size: metadata.len(),
+                    });
+                }
+            }
+            files.sort_by(|a, b| {
+                if a.is_dir == b.is_dir {
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                } else {
+                    b.is_dir.cmp(&a.is_dir)
+                }
+            });
+            Ok(Json(files))
+        },
+        Err(_) => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn get_services() -> Json<Vec<ServiceInfo>> {
+    let services_to_check = ["nginx", "mysql", "ssh", "docker", "cron"];
+    let mut services = Vec::new();
+
+    for service_name in services_to_check {
+        let output = std::process::Command::new("systemctl")
+            .arg("is-active")
+            .arg(service_name)
+            .output();
+
+        let status = match output {
+            Ok(out) => {
+                if out.status.success() {
+                    "active".to_string()
+                } else {
+                    "inactive".to_string()
+                }
+            }
+            Err(_) => "unknown".to_string(),
+        };
+
+        services.push(ServiceInfo {
+            name: service_name.to_string(),
+            status,
+            description: format!("System service: {}", service_name),
+        });
+    }
+
+    Json(services)
 }
 
 async fn get_processes(State(state): State<AppState>) -> Json<Vec<ProcessInfo>> {
@@ -100,36 +222,52 @@ async fn get_processes(State(state): State<AppState>) -> Json<Vec<ProcessInfo>> 
         })
         .collect();
 
-    // Sort by CPU usage descending and take top 20
     processes.sort_by(|a, b| b.cpu_usage.partial_cmp(&a.cpu_usage).unwrap_or(std::cmp::Ordering::Equal));
     processes.truncate(20);
 
     Json(processes)
 }
 
-async fn login_handler(Json(payload): Json<LoginRequest>) -> Result<Json<LoginResponse>, StatusCode> {
-    // TODO: Use a real database and hashed passwords
-    if payload.username == "admin" && payload.password == "password" {
-        let expiration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as usize + 3600; // 1 hour expiration
+async fn login_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<LoginRequest>
+) -> Result<Json<LoginResponse>, StatusCode> {
+    let user = sqlx::query_as::<_, (String,)>("SELECT password FROM users WHERE username = ?")
+        .bind(&payload.username)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let claims = Claims {
-            sub: payload.username,
-            exp: expiration,
-        };
+    if let Some((hashed_password,)) = user {
+        if verify(&payload.password, &hashed_password).unwrap_or(false) {
+            let expiration = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as usize + 3600;
 
-        let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET_KEY))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let claims = Claims {
+                sub: payload.username,
+                exp: expiration,
+            };
 
-        Ok(Json(LoginResponse { token }))
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+            let token = encode(
+                &Header::default(), 
+                &claims, 
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes())
+            ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            return Ok(Json(LoginResponse { token }));
+        }
     }
+
+    Err(StatusCode::UNAUTHORIZED)
 }
 
-async fn auth_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request, 
+    next: Next
+) -> Result<Response, StatusCode> {
     let auth_header = req.headers().get(header::AUTHORIZATION)
         .and_then(|header| header.to_str().ok());
 
@@ -141,7 +279,11 @@ async fn auth_middleware(req: Request, next: Next) -> Result<Response, StatusCod
 
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
         let validation = Validation::default();
-        let token_data = decode::<Claims>(token, &DecodingKey::from_secret(SECRET_KEY), &validation);
+        let token_data = decode::<Claims>(
+            token, 
+            &DecodingKey::from_secret(state.jwt_secret.as_bytes()), 
+            &validation
+        );
 
         if token_data.is_ok() {
             Ok(next.run(req).await)
@@ -159,8 +301,6 @@ async fn get_system_metrics(State(state): State<AppState>) -> Json<SystemMetrics
     
     sys.refresh_cpu();
     sys.refresh_memory();
-    // Optimization: Don't refresh the list (hardware scan) every time, just the usage stats.
-    // In a real prod app, we would refresh the list in a background task every minute.
     disks.refresh();
 
     let cpu_usage = sys.global_cpu_info().cpu_usage();
